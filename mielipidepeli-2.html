@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mielipidepeli</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, push, onValue, update, remove } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBW_fIjtdQokrtat3bYGbA1mQum8tNFs38",
+    authDomain: "mielipidepeli.firebaseapp.com",
+    databaseURL: "https://mielipidepeli-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "mielipidepeli",
+    storageBucket: "mielipidepeli.firebasestorage.app",
+    messagingSenderId: "541615971554",
+    appId: "1:541615971554:web:f0723137bcb19368cb12bb"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+
+  // ── State ──
+  let myRole = null;
+  let myName = null;
+  let roomCode = null;
+  let myPlayerId = null;
+  let currentPhase = null;
+  let myAnswerKey = null;
+  let hasVoted = false;
+  let questionBank = [];
+  let currentQuestionIndex = 0;
+
+  // ── Helpers ──
+  function genCode() {
+    return Math.random().toString(36).substring(2, 7).toUpperCase();
+  }
+
+  function roomRef(path = '') {
+    return ref(db, `rooms/${roomCode}${path}`);
+  }
+
+  function show(id) {
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+  }
+
+  // ── Entry ──
+  window.goHost = async () => {
+    myRole = 'host';
+    roomCode = genCode();
+    await set(roomRef(), {
+      host: true,
+      phase: 'lobby',
+      question: '',
+      questionIndex: 0,
+      totalQuestions: 0,
+      players: {},
+      answers: {},
+      votes: {}
+    });
+    document.getElementById('display-code').textContent = roomCode;
+    show('screen-host-lobby');
+    listenRoom();
+  };
+
+  window.goJoin = () => {
+    show('screen-join');
+  };
+
+  window.joinRoom = async () => {
+    const code = document.getElementById('input-code').value.trim().toUpperCase();
+    const name = document.getElementById('input-name').value.trim();
+    if (!code || !name) return shake('join-form');
+
+    roomCode = code;
+    const snap = await get(roomRef());
+    if (!snap.exists()) return showError('Huonetta ei löydy!');
+
+    myName = name;
+    myRole = 'player';
+    myPlayerId = push(roomRef('/players')).key;
+    await set(roomRef(`/players/${myPlayerId}`), { name, score: 0 });
+
+    show('screen-player-lobby');
+    document.getElementById('player-waiting-name').textContent = name;
+    listenRoom();
+  };
+
+  // ── Kysymyspankki ──
+  window.addQuestion = () => {
+    const input = document.getElementById('new-question-input');
+    const q = input.value.trim();
+    if (!q) return shake('new-question-input');
+    questionBank.push(q);
+    input.value = '';
+    renderQuestionBank();
+  };
+
+  window.removeQuestion = (i) => {
+    questionBank.splice(i, 1);
+    renderQuestionBank();
+  };
+
+  function renderQuestionBank() {
+    const el = document.getElementById('question-bank-list');
+    if (questionBank.length === 0) {
+      el.innerHTML = '<span class="empty">Ei kysymyksiä vielä — lisää alla</span>';
+      document.getElementById('btn-start-game').disabled = true;
+      return;
+    }
+    document.getElementById('btn-start-game').disabled = false;
+    el.innerHTML = questionBank.map((q, i) => `
+      <div class="q-bank-item">
+        <span class="q-num">${i + 1}</span>
+        <span class="q-text">${q}</span>
+        <button class="q-remove" onclick="removeQuestion(${i})">✕</button>
+      </div>
+    `).join('');
+  }
+
+  // ── Host controls ──
+  window.startGame = async () => {
+    if (questionBank.length === 0) return;
+    currentQuestionIndex = 0;
+    await launchQuestion(0);
+  };
+
+  async function launchQuestion(index) {
+    const q = questionBank[index];
+    await update(roomRef(), {
+      phase: 'answering',
+      question: q,
+      questionIndex: index,
+      totalQuestions: questionBank.length,
+      answers: null,
+      votes: null,
+      answerOrder: null
+    });
+  }
+
+  window.openVoting = async () => {
+    const snap = await get(roomRef('/answers'));
+    const answers = snap.val() || {};
+    const keys = Object.keys(answers);
+    const shuffled = keys.sort(() => Math.random() - 0.5);
+    await update(roomRef(), {
+      phase: 'voting',
+      answerOrder: shuffled
+    });
+  };
+
+  window.showResults = async () => {
+    await update(roomRef(), { phase: 'results' });
+  };
+
+  window.showScoreboard = async () => {
+    await update(roomRef(), { phase: 'scoreboard' });
+  };
+
+  window.nextQuestion = async () => {
+    currentQuestionIndex++;
+    if (currentQuestionIndex < questionBank.length) {
+      await launchQuestion(currentQuestionIndex);
+    } else {
+      await update(roomRef(), { phase: 'gameover' });
+    }
+  };
+
+  window.endGame = async () => {
+    await update(roomRef(), { phase: 'gameover' });
+  };
+
+  // ── Player: submit answer ──
+  window.submitAnswer = async () => {
+    const ans = document.getElementById('player-answer').value.trim();
+    if (!ans) return shake('player-answer');
+    myAnswerKey = myPlayerId;
+    await set(roomRef(`/answers/${myPlayerId}`), {
+      text: ans,
+      authorId: myPlayerId,
+      authorName: myName
+    });
+    document.getElementById('player-answer').disabled = true;
+    document.getElementById('btn-submit-answer').disabled = true;
+    document.getElementById('answer-sent-msg').style.display = 'block';
+  };
+
+  // ── Player: vote ──
+  window.castVote = async (targetAnswerKey) => {
+    if (hasVoted) return;
+    if (targetAnswerKey === myAnswerKey) return;
+    hasVoted = true;
+    await set(roomRef(`/votes/${myPlayerId}`), targetAnswerKey);
+    document.querySelectorAll('.vote-btn').forEach(b => {
+      b.disabled = true;
+      if (b.dataset.key === targetAnswerKey) b.classList.add('voted');
+    });
+    document.getElementById('voted-msg').style.display = 'block';
+  };
+
+  // ── Room listener ──
+  function listenRoom() {
+    onValue(roomRef(), (snap) => {
+      const data = snap.val();
+      if (!data) return;
+      const phase = data.phase;
+      if (myRole === 'host') {
+        handleHostPhase(phase, data);
+      } else {
+        handlePlayerPhase(phase, data);
+      }
+      currentPhase = phase;
+    });
+  }
+
+  function handleHostPhase(phase, data) {
+    if (phase === 'lobby') {
+      show('screen-host-lobby');
+      renderPlayerList(data.players);
+    } else if (phase === 'answering') {
+      show('screen-host-answering');
+      document.getElementById('host-q-display').textContent = data.question;
+      renderAnswerCount(data.answers, data.players);
+      renderProgress(data.questionIndex, data.totalQuestions, 'host-progress');
+    } else if (phase === 'voting') {
+      show('screen-host-voting');
+      renderAnswersForHost(data.answers, data.answerOrder, data.votes);
+      renderProgress(data.questionIndex, data.totalQuestions, 'host-vote-progress');
+    } else if (phase === 'results') {
+      show('screen-host-results');
+      renderResults(data.answers, data.votes, data.players);
+      renderProgress(data.questionIndex, data.totalQuestions, 'host-results-progress');
+      const isLast = (data.questionIndex + 1) >= data.totalQuestions;
+      document.getElementById('btn-next-or-end').textContent = isLast ? 'Loppupisteet →' : 'Pisteet →';
+    } else if (phase === 'scoreboard') {
+      show('screen-host-scoreboard');
+      renderScoreboard(data.players);
+      const isLast = (data.questionIndex + 1) >= data.totalQuestions;
+      const btn = document.getElementById('btn-scoreboard-next');
+      btn.textContent = isLast ? 'Lopeta peli' : `Kysymys ${data.questionIndex + 2} →`;
+      btn.onclick = isLast ? endGame : nextQuestion;
+    } else if (phase === 'gameover') {
+      show('screen-host-gameover');
+      renderScoreboard(data.players, 'final-scoreboard-list');
+    }
+  }
+
+  function handlePlayerPhase(phase, data) {
+    if (phase === 'lobby') {
+      show('screen-player-lobby');
+    } else if (phase === 'answering') {
+      hasVoted = false;
+      myAnswerKey = null;
+      show('screen-player-answering');
+      document.getElementById('player-q-display').textContent = data.question;
+      document.getElementById('player-answer').value = '';
+      document.getElementById('player-answer').disabled = false;
+      document.getElementById('btn-submit-answer').disabled = false;
+      document.getElementById('answer-sent-msg').style.display = 'none';
+      renderProgress(data.questionIndex, data.totalQuestions, 'player-progress');
+    } else if (phase === 'voting') {
+      show('screen-player-voting');
+      renderVotingOptions(data.answers, data.answerOrder, data.question);
+      renderProgress(data.questionIndex, data.totalQuestions, 'player-vote-progress');
+    } else if (phase === 'results') {
+      show('screen-player-results');
+      renderPlayerResults(data.answers, data.votes, data.players);
+    } else if (phase === 'scoreboard') {
+      show('screen-player-scoreboard');
+      renderPlayerScoreboard(data.players);
+    } else if (phase === 'gameover') {
+      show('screen-player-gameover');
+      renderPlayerScoreboard(data.players, 'player-final-scoreboard-list');
+    }
+  }
+
+  // ── Render helpers ──
+  function renderProgress(index, total, elId) {
+    const el = document.getElementById(elId);
+    if (!el || !total) return;
+    el.innerHTML = `
+      <div class="progress-bar">
+        <div class="progress-fill" style="width:${((index+1)/total)*100}%"></div>
+      </div>
+      <div class="progress-label">Kysymys ${index + 1} / ${total}</div>
+    `;
+  }
+
+  function renderPlayerList(players) {
+    const el = document.getElementById('host-player-list');
+    if (!players) { el.innerHTML = '<span class="empty">Odottaa pelaajia...</span>'; return; }
+    el.innerHTML = Object.values(players).map(p =>
+      `<span class="player-chip">${p.name}</span>`
+    ).join('');
+  }
+
+  function renderAnswerCount(answers, players) {
+    const ansCount = answers ? Object.keys(answers).length : 0;
+    const playerCount = players ? Object.keys(players).length : 0;
+    document.getElementById('answer-count').textContent = `${ansCount} / ${playerCount} vastannut`;
+  }
+
+  function renderAnswersForHost(answers, order, votes) {
+    const el = document.getElementById('host-vote-display');
+    if (!answers) { el.innerHTML = ''; return; }
+    const voteMap = {};
+    if (votes) Object.values(votes).forEach(k => { voteMap[k] = (voteMap[k] || 0) + 1; });
+    const keys = order || Object.keys(answers);
+    el.innerHTML = keys.map((k, i) => {
+      const a = answers[k];
+      const v = voteMap[k] || 0;
+      return `<div class="answer-card" style="--i:${i}">
+        <span class="ans-text">${a.text}</span>
+        <span class="vote-pill" id="vpill-${k}">${v} ääntä</span>
+      </div>`;
+    }).join('');
+
+    onValue(roomRef('/votes'), (snap) => {
+      const v = snap.val() || {};
+      const vm = {};
+      Object.values(v).forEach(k => { vm[k] = (vm[k] || 0) + 1; });
+      keys.forEach(k => {
+        const pill = document.getElementById(`vpill-${k}`);
+        if (pill) pill.textContent = `${vm[k] || 0} ääntä`;
+      });
+    });
+  }
+
+  function renderVotingOptions(answers, order, question) {
+    document.getElementById('vote-q-display').textContent = question || '';
+    const el = document.getElementById('voting-options');
+    if (!answers) { el.innerHTML = ''; return; }
+    const keys = order || Object.keys(answers);
+    hasVoted = false;
+    el.innerHTML = keys.map((k, i) => {
+      const a = answers[k];
+      const isOwn = (k === myPlayerId);
+      return `<button class="vote-btn ${isOwn ? 'own-answer' : ''}"
+        data-key="${k}"
+        onclick="castVote('${k}')"
+        ${isOwn ? 'disabled title="Oma vastauksesi"' : ''}>
+        ${a.text}
+        ${isOwn ? '<span class="own-tag">oma</span>' : ''}
+      </button>`;
+    }).join('');
+    document.getElementById('voted-msg').style.display = 'none';
+  }
+
+  function renderResults(answers, votes, players) {
+    const voteMap = {};
+    if (votes) Object.values(votes).forEach(k => { voteMap[k] = (voteMap[k] || 0) + 1; });
+    const updates = {};
+    if (players) {
+      Object.entries(players).forEach(([pid, p]) => {
+        updates[`players/${pid}/score`] = (p.score || 0) + (voteMap[pid] || 0);
+      });
+      update(roomRef(), updates);
+    }
+    const el = document.getElementById('host-results-list');
+    if (!answers) { el.innerHTML = ''; return; }
+    const sorted = Object.entries(answers)
+      .map(([k, a]) => ({ ...a, key: k, votes: voteMap[k] || 0 }))
+      .sort((a, b) => b.votes - a.votes);
+    el.innerHTML = sorted.map((a, i) => `
+      <div class="result-row" style="--i:${i}">
+        <div class="result-rank">${i + 1}</div>
+        <div class="result-content">
+          <div class="result-answer">${a.text}</div>
+          <div class="result-author">${a.authorName}</div>
+        </div>
+        <div class="result-votes">${a.votes} ääntä</div>
+      </div>
+    `).join('');
+  }
+
+  function renderPlayerResults(answers, votes, players) {
+    const voteMap = {};
+    if (votes) Object.values(votes).forEach(k => { voteMap[k] = (voteMap[k] || 0) + 1; });
+    const myVotes = voteMap[myPlayerId] || 0;
+    document.getElementById('player-results-info').innerHTML = `
+      <div class="my-score-gained">+${myVotes} pistettä</div>
+      <div class="score-sub">Vastauksesi sai ${myVotes} ääntä</div>
+    `;
+  }
+
+  function renderScoreboard(players, elId = 'scoreboard-list') {
+    if (!players) return;
+    const sorted = Object.values(players).sort((a, b) => b.score - a.score);
+    const el = document.getElementById(elId);
+    if (!el) return;
+    el.innerHTML = sorted.map((p, i) => `
+      <div class="score-row" style="--i:${i}">
+        <span class="score-rank">${['🥇','🥈','🥉'][i] || (i+1)+'.'}
+</span>
+        <span class="score-name">${p.name}</span>
+        <span class="score-pts">${p.score} pistettä</span>
+      </div>
+    `).join('');
+  }
+
+  function renderPlayerScoreboard(players, elId = 'player-scoreboard-list') {
+    if (!players) return;
+    const sorted = Object.values(players).sort((a, b) => b.score - a.score);
+    const el = document.getElementById(elId);
+    if (!el) return;
+    el.innerHTML = sorted.map((p, i) => `
+      <div class="score-row ${p.name === myName ? 'me' : ''}" style="--i:${i}">
+        <span class="score-rank">${['🥇','🥈','🥉'][i] || (i+1)+'.'}
+</span>
+        <span class="score-name">${p.name}</span>
+        <span class="score-pts">${p.score} p</span>
+      </div>
+    `).join('');
+  }
+
+  function shake(id) {
+    const el = document.getElementById(id);
+    el.classList.add('shake');
+    setTimeout(() => el.classList.remove('shake'), 500);
+  }
+
+  function showError(msg) {
+    document.getElementById('join-error').textContent = msg;
+    document.getElementById('join-error').style.display = 'block';
+  }
+
+  // init question bank render
+  renderQuestionBank();
+</script>
+
+<style>
+  :root {
+    --bg: #0d0d0f;
+    --surface: #17171a;
+    --surface2: #1f1f24;
+    --accent: #f0e040;
+    --accent2: #ff6b35;
+    --green: #3dffa0;
+    --text: #f0ede6;
+    --muted: #888;
+    --radius: 16px;
+    --font-display: 'Syne', sans-serif;
+    --font-body: 'DM Sans', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 60% 50% at 20% 20%, rgba(240,224,64,0.07) 0%, transparent 60%),
+      radial-gradient(ellipse 50% 60% at 80% 80%, rgba(255,107,53,0.06) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .screen {
+    display: none;
+    width: 100%;
+    max-width: 560px;
+    padding: 24px 20px;
+    position: relative;
+    z-index: 1;
+    animation: fadeUp 0.35s ease both;
+  }
+
+  .screen.active { display: block; }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(24px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .logo {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 2rem;
+    letter-spacing: -0.03em;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+
+  .logo span { color: var(--accent2); }
+
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 1.4rem;
+    margin-bottom: 20px;
+    letter-spacing: -0.02em;
+  }
+
+  .sub {
+    font-size: 0.875rem;
+    color: var(--muted);
+    margin-bottom: 32px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: var(--radius);
+    padding: 28px;
+    margin-bottom: 16px;
+  }
+
+  input[type="text"], textarea {
+    width: 100%;
+    background: var(--surface2);
+    border: 2px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 1rem;
+    padding: 14px 18px;
+    outline: none;
+    transition: border-color 0.2s;
+    margin-bottom: 12px;
+  }
+
+  input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
+
+  .btn {
+    display: inline-block;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 1rem;
+    padding: 14px 28px;
+    border-radius: 12px;
+    border: none;
+    cursor: pointer;
+    transition: transform 0.15s, opacity 0.15s;
+    letter-spacing: 0.01em;
+  }
+
+  .btn:hover { transform: translateY(-2px); }
+  .btn:active { transform: translateY(0); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  .btn-primary { background: var(--accent); color: #0d0d0f; width: 100%; margin-bottom: 10px; }
+  .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid rgba(255,255,255,0.1); width: 100%; margin-bottom: 10px; }
+  .btn-orange { background: var(--accent2); color: white; width: 100%; margin-bottom: 10px; }
+  .btn-green { background: var(--green); color: #0d0d0f; width: 100%; margin-bottom: 10px; }
+
+  .room-code-big {
+    font-family: var(--font-display);
+    font-size: 3.5rem;
+    font-weight: 800;
+    letter-spacing: 0.15em;
+    color: var(--accent);
+    text-align: center;
+    padding: 20px;
+    background: var(--surface2);
+    border-radius: var(--radius);
+    margin: 20px 0;
+    border: 2px dashed rgba(240,224,64,0.3);
+  }
+
+  #host-player-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    min-height: 40px;
+    padding: 12px 0;
+  }
+
+  .player-chip {
+    background: var(--surface2);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 999px;
+    padding: 6px 16px;
+    font-size: 0.875rem;
+    animation: popIn 0.3s ease both;
+  }
+
+  @keyframes popIn {
+    from { transform: scale(0.7); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+
+  .empty { color: var(--muted); font-size: 0.875rem; }
+
+  /* Kysymyspankki */
+  .q-add-row {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+
+  .q-add-row input {
+    flex: 1;
+    margin-bottom: 0;
+  }
+
+  .q-add-btn {
+    background: var(--accent);
+    color: #0d0d0f;
+    border: none;
+    border-radius: 12px;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 1.2rem;
+    padding: 0 20px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: transform 0.15s;
+  }
+
+  .q-add-btn:hover { transform: scale(1.05); }
+
+  #question-bank-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 16px;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+
+  .q-bank-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--surface2);
+    border-radius: 10px;
+    padding: 10px 14px;
+    animation: fadeUp 0.2s ease both;
+  }
+
+  .q-num {
+    font-family: var(--font-display);
+    font-weight: 700;
+    color: var(--accent);
+    min-width: 22px;
+    font-size: 0.9rem;
+  }
+
+  .q-text {
+    flex: 1;
+    font-size: 0.9rem;
+    line-height: 1.3;
+  }
+
+  .q-remove {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 2px 6px;
+    border-radius: 6px;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .q-remove:hover { color: var(--accent2); background: rgba(255,107,53,0.1); }
+
+  /* Progress */
+  .progress-wrap { margin-bottom: 16px; }
+
+  .progress-bar {
+    height: 4px;
+    background: var(--surface2);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 6px;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width 0.4s ease;
+  }
+
+  .progress-label {
+    font-size: 0.75rem;
+    color: var(--muted);
+    text-align: right;
+    letter-spacing: 0.03em;
+  }
+
+  .question-display {
+    font-family: var(--font-display);
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    color: var(--text);
+    padding: 20px 0 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    margin-bottom: 20px;
+  }
+
+  .answer-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface2);
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin-bottom: 10px;
+    animation: fadeUp 0.3s ease calc(var(--i) * 0.06s) both;
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .ans-text { font-size: 1rem; }
+  .vote-pill {
+    background: var(--accent);
+    color: #0d0d0f;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 0.8rem;
+    padding: 4px 12px;
+    border-radius: 999px;
+    min-width: 70px;
+    text-align: center;
+    transition: all 0.3s;
+  }
+
+  .vote-btn {
+    display: block;
+    width: 100%;
+    background: var(--surface2);
+    border: 2px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 1.05rem;
+    padding: 18px 20px;
+    margin-bottom: 10px;
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.2s;
+    position: relative;
+  }
+
+  .vote-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: rgba(240,224,64,0.07);
+    transform: translateX(4px);
+  }
+
+  .vote-btn.voted { border-color: var(--green); background: rgba(61,255,160,0.1); color: var(--green); }
+  .vote-btn.own-answer { opacity: 0.4; cursor: not-allowed; }
+
+  .own-tag {
+    font-size: 0.7rem;
+    background: var(--muted);
+    color: var(--bg);
+    padding: 2px 8px;
+    border-radius: 999px;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+
+  .result-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--surface2);
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin-bottom: 10px;
+    animation: fadeUp 0.4s ease calc(var(--i) * 0.08s) both;
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .result-row:first-child { border-color: var(--accent); background: rgba(240,224,64,0.06); }
+  .result-rank { font-family: var(--font-display); font-size: 1.4rem; font-weight: 800; color: var(--accent); min-width: 30px; }
+  .result-content { flex: 1; }
+  .result-answer { font-size: 1rem; margin-bottom: 3px; }
+  .result-author { font-size: 0.8rem; color: var(--muted); }
+  .result-votes { font-family: var(--font-display); font-weight: 700; color: var(--accent); font-size: 1.1rem; }
+
+  .score-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 18px;
+    background: var(--surface2);
+    border-radius: 12px;
+    margin-bottom: 8px;
+    animation: fadeUp 0.4s ease calc(var(--i) * 0.07s) both;
+  }
+
+  .score-row.me { border: 2px solid var(--accent); background: rgba(240,224,64,0.06); }
+  .score-row:first-child { font-size: 1.1rem; }
+  .score-rank { font-size: 1.3rem; min-width: 30px; }
+  .score-name { flex: 1; font-weight: 500; }
+  .score-pts { font-family: var(--font-display); font-weight: 700; color: var(--accent); }
+
+  .answer-count-display {
+    font-family: var(--font-display);
+    font-size: 2.5rem;
+    font-weight: 800;
+    color: var(--accent);
+    text-align: center;
+    margin: 16px 0;
+  }
+
+  .my-score-gained {
+    font-family: var(--font-display);
+    font-size: 3rem;
+    font-weight: 800;
+    color: var(--green);
+    text-align: center;
+    padding: 30px 0 8px;
+  }
+
+  .score-sub { text-align: center; color: var(--muted); margin-bottom: 24px; }
+
+  .waiting-icon {
+    font-size: 3rem;
+    text-align: center;
+    margin: 20px 0;
+    animation: pulse 2s ease infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.6; transform: scale(0.95); }
+  }
+
+  .success-msg { color: var(--green); font-size: 0.9rem; margin-top: 8px; display: none; }
+
+  #join-error { color: var(--accent2); font-size: 0.875rem; margin-top: 6px; display: none; }
+
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-8px); }
+    75% { transform: translateX(8px); }
+  }
+
+  .shake { animation: shake 0.4s ease; }
+
+  .gameover-trophy { font-size: 4rem; text-align: center; margin: 20px 0; }
+
+  @media (max-width: 480px) {
+    .room-code-big { font-size: 2.5rem; }
+    .question-display { font-size: 1.2rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- 1. Aloitus -->
+<div class="screen active" id="screen-home">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <p class="sub">Kuka tietää mitä muut ajattelevat?</p>
+  <div class="card">
+    <h2>Oletko pelinjärjestäjä vai pelaaja?</h2>
+    <button class="btn btn-primary" onclick="goHost()">🎮 Luo uusi huone</button>
+    <button class="btn btn-secondary" onclick="goJoin()">👋 Liity peliin</button>
+  </div>
+</div>
+
+<!-- 2. Liittyminen -->
+<div class="screen" id="screen-join">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card" id="join-form">
+    <h2>Liity peliin</h2>
+    <input type="text" id="input-code" placeholder="Huonekoodi (esim. AB12X)" maxlength="6" style="text-transform:uppercase;letter-spacing:0.15em;font-family:var(--font-display);font-weight:700;font-size:1.3rem;text-align:center;">
+    <input type="text" id="input-name" placeholder="Nimesi" maxlength="20">
+    <div id="join-error"></div>
+    <button class="btn btn-primary" onclick="joinRoom()">Liity →</button>
+    <button class="btn btn-secondary" onclick="show('screen-home')">← Takaisin</button>
+  </div>
+</div>
+
+<!-- 3. Host: Lobby + kysymyspankki -->
+<div class="screen" id="screen-host-lobby">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <p class="sub">Pelaajat liittyvät koodilla:</p>
+  <div class="room-code-big" id="display-code"></div>
+  <div class="card">
+    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.05em;">Pelaajat</div>
+    <div id="host-player-list"></div>
+  </div>
+  <div class="card">
+    <h2>Kysymykset</h2>
+    <div id="question-bank-list"></div>
+    <div class="q-add-row">
+      <input type="text" id="new-question-input" placeholder="Kirjoita kysymys..." maxlength="150" onkeydown="if(event.key==='Enter') addQuestion()">
+      <button class="q-add-btn" onclick="addQuestion()">+</button>
+    </div>
+    <button class="btn btn-orange" id="btn-start-game" onclick="startGame()" disabled>Aloita peli →</button>
+  </div>
+</div>
+
+<!-- 4. Host: Vastaaminen -->
+<div class="screen" id="screen-host-answering">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="progress-wrap" id="host-progress"></div>
+    <div class="question-display" id="host-q-display"></div>
+    <div class="answer-count-display" id="answer-count">0 vastannut</div>
+    <p class="sub" style="text-align:center;">Odota kunnes kaikki ovat vastanneet</p>
+  </div>
+  <button class="btn btn-green" onclick="openVoting()">Avaa äänestys →</button>
+</div>
+
+<!-- 5. Host: Äänestys -->
+<div class="screen" id="screen-host-voting">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="progress-wrap" id="host-vote-progress"></div>
+    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:12px;text-transform:uppercase;letter-spacing:0.05em;">Vastaukset — äänet reaaliajassa</div>
+    <div id="host-vote-display"></div>
+  </div>
+  <button class="btn btn-orange" onclick="showResults()">Näytä tulokset →</button>
+</div>
+
+<!-- 6. Host: Tulokset -->
+<div class="screen" id="screen-host-results">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="progress-wrap" id="host-results-progress"></div>
+    <h2>🏆 Kierroksen tulokset</h2>
+    <div id="host-results-list"></div>
+  </div>
+  <button class="btn btn-primary" id="btn-next-or-end" onclick="showScoreboard()">Pisteet →</button>
+</div>
+
+<!-- 7. Host: Pisteet -->
+<div class="screen" id="screen-host-scoreboard">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <h2>📊 Tilanne</h2>
+    <div id="scoreboard-list"></div>
+  </div>
+  <button class="btn btn-orange" id="btn-scoreboard-next" onclick="nextQuestion()">Seuraava kysymys →</button>
+</div>
+
+<!-- 8. Host: Peli ohi -->
+<div class="screen" id="screen-host-gameover">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="gameover-trophy">🏆</div>
+    <h2 style="text-align:center;">Peli ohi!</h2>
+    <div id="final-scoreboard-list"></div>
+  </div>
+  <button class="btn btn-primary" onclick="location.reload()">Uusi peli</button>
+</div>
+
+<!-- 9. Pelaaja: Lobby -->
+<div class="screen" id="screen-player-lobby">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="waiting-icon">⏳</div>
+    <h2 style="text-align:center;">Odotellaan alkua...</h2>
+    <p style="text-align:center;color:var(--muted);">Pelinjärjestäjä aloittaa pian</p>
+    <p style="text-align:center;margin-top:16px;color:var(--accent);font-family:var(--font-display);font-weight:700;" id="player-waiting-name"></p>
+  </div>
+</div>
+
+<!-- 10. Pelaaja: Vastaa -->
+<div class="screen" id="screen-player-answering">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="progress-wrap" id="player-progress"></div>
+    <div class="question-display" id="player-q-display"></div>
+    <input type="text" id="player-answer" placeholder="Kirjoita vastauksesi..." maxlength="120">
+    <button class="btn btn-primary" id="btn-submit-answer" onclick="submitAnswer()">Lähetä vastaus →</button>
+    <div class="success-msg" id="answer-sent-msg">✅ Vastaus lähetetty! Odota äänestystä...</div>
+  </div>
+</div>
+
+<!-- 11. Pelaaja: Äänestys -->
+<div class="screen" id="screen-player-voting">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="progress-wrap" id="player-vote-progress"></div>
+    <div style="font-size:0.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Kysymys</div>
+    <div class="question-display" id="vote-q-display" style="padding-top:0"></div>
+    <div style="font-size:0.85rem;color:var(--muted);margin-bottom:16px;">Valitse paras vastaus — et voi äänestää omaasi</div>
+    <div id="voting-options"></div>
+    <div class="success-msg" id="voted-msg">✅ Äänesi on annettu!</div>
+  </div>
+</div>
+
+<!-- 12. Pelaaja: Tulokset -->
+<div class="screen" id="screen-player-results">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <h2 style="text-align:center;">Kierros ohi!</h2>
+    <div id="player-results-info"></div>
+  </div>
+</div>
+
+<!-- 13. Pelaaja: Pisteet -->
+<div class="screen" id="screen-player-scoreboard">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <h2>📊 Tilanne</h2>
+    <div id="player-scoreboard-list"></div>
+  </div>
+</div>
+
+<!-- 14. Pelaaja: Peli ohi -->
+<div class="screen" id="screen-player-gameover">
+  <div class="logo">Mieli<span>pide</span>peli</div>
+  <div class="card">
+    <div class="gameover-trophy">🎉</div>
+    <h2 style="text-align:center;">Peli ohi!</h2>
+    <div id="player-final-scoreboard-list"></div>
+  </div>
+  <button class="btn btn-secondary" onclick="location.reload()">Takaisin alkuun</button>
+</div>
+
+</body>
+</html>
