@@ -137,7 +137,8 @@
       totalQuestions: questionBank.length,
       answers: null,
       votes: null,
-      answerOrder: null
+      answerOrder: null,
+      scoresUpdated: false
     });
   }
 
@@ -231,7 +232,7 @@
       renderProgress(data.questionIndex, data.totalQuestions, 'host-vote-progress');
     } else if (phase === 'results') {
       show('screen-host-results');
-      renderResults(data.answers, data.votes, data.players);
+      renderResults(data.answers, data.votes, data.players, data.scoresUpdated);
       renderProgress(data.questionIndex, data.totalQuestions, 'host-results-progress');
       const isLast = (data.questionIndex + 1) >= data.totalQuestions;
       document.getElementById('btn-next-or-end').textContent = isLast ? 'Loppupisteet →' : 'Pisteet →';
@@ -303,6 +304,8 @@
     document.getElementById('answer-count').textContent = `${ansCount} / ${playerCount} vastannut`;
   }
 
+  let voteListener = null;
+
   function renderAnswersForHost(answers, order, votes) {
     const el = document.getElementById('host-vote-display');
     if (!answers) { el.innerHTML = ''; return; }
@@ -318,7 +321,8 @@
       </div>`;
     }).join('');
 
-    onValue(roomRef('/votes'), (snap) => {
+    if (voteListener) voteListener();
+    voteListener = onValue(roomRef('/votes'), (snap) => {
       const v = snap.val() || {};
       const vm = {};
       Object.values(v).forEach(k => { vm[k] = (vm[k] || 0) + 1; });
@@ -349,11 +353,19 @@
     document.getElementById('voted-msg').style.display = 'none';
   }
 
-  function renderResults(answers, votes, players) {
+  function renderResults(answers, votes, players, scoresUpdated) {
     const voteMap = {};
-    if (votes) Object.values(votes).forEach(k => { voteMap[k] = (voteMap[k] || 0) + 1; });
-    const updates = {};
-    if (players) {
+    const voterNames = {};
+    if (votes && answers) {
+      Object.entries(votes).forEach(([voterId, targetKey]) => {
+        voteMap[targetKey] = (voteMap[targetKey] || 0) + 1;
+        if (!voterNames[targetKey]) voterNames[targetKey] = [];
+        const voter = players && Object.entries(players).find(([pid]) => pid === voterId);
+        if (voter) voterNames[targetKey].push(voter[1].name);
+      });
+    }
+    if (players && !scoresUpdated) {
+      const updates = { scoresUpdated: true };
       Object.entries(players).forEach(([pid, p]) => {
         updates[`players/${pid}/score`] = (p.score || 0) + (voteMap[pid] || 0);
       });
@@ -362,7 +374,7 @@
     const el = document.getElementById('host-results-list');
     if (!answers) { el.innerHTML = ''; return; }
     const sorted = Object.entries(answers)
-      .map(([k, a]) => ({ ...a, key: k, votes: voteMap[k] || 0 }))
+      .map(([k, a]) => ({ ...a, key: k, votes: voteMap[k] || 0, voters: voterNames[k] || [] }))
       .sort((a, b) => b.votes - a.votes);
     el.innerHTML = sorted.map((a, i) => `
       <div class="result-row" style="--i:${i}">
@@ -370,6 +382,7 @@
         <div class="result-content">
           <div class="result-answer">${a.text}</div>
           <div class="result-author">${a.authorName}</div>
+          ${a.voters.length > 0 ? `<div class="result-voters">Äänesti: ${a.voters.join(', ')}</div>` : ''}
         </div>
         <div class="result-votes">${a.votes} ääntä</div>
       </div>
@@ -393,7 +406,7 @@
     if (!el) return;
     el.innerHTML = sorted.map((p, i) => `
       <div class="score-row" style="--i:${i}">
-        <span class="score-rank">${['🥇','🥈','🥉'][i] || (i+1)+'.'}
+        <span class="score-rank">${(i+1)+'.'}
 </span>
         <span class="score-name">${p.name}</span>
         <span class="score-pts">${p.score} pistettä</span>
@@ -408,7 +421,7 @@
     if (!el) return;
     el.innerHTML = sorted.map((p, i) => `
       <div class="score-row ${p.name === myName ? 'me' : ''}" style="--i:${i}">
-        <span class="score-rank">${['🥇','🥈','🥉'][i] || (i+1)+'.'}
+        <span class="score-rank">${(i+1)+'.'}
 </span>
         <span class="score-name">${p.name}</span>
         <span class="score-pts">${p.score} p</span>
@@ -433,16 +446,16 @@
 
 <style>
   :root {
-    --bg: #0d0d0f;
-    --surface: #17171a;
-    --surface2: #1f1f24;
-    --accent: #f0e040;
-    --accent2: #ff6b35;
-    --green: #3dffa0;
-    --text: #f0ede6;
-    --muted: #888;
+    --bg: #0d0d0d;
+    --surface: #161616;
+    --surface2: #1e1e1e;
+    --accent: #ffffff;
+    --accent2: #aaaaaa;
+    --green: #cccccc;
+    --text: #eeeeee;
+    --muted: #666;
     --radius: 16px;
-    --font-display: 'Syne', sans-serif;
+    --font-display: 'DM Sans', sans-serif;
     --font-body: 'DM Sans', sans-serif;
   }
 
@@ -496,7 +509,7 @@
     margin-bottom: 4px;
   }
 
-  .logo span { color: var(--accent2); }
+  .logo span { color: var(--muted); }
 
   h2 {
     font-family: var(--font-display);
@@ -553,10 +566,10 @@
   .btn:active { transform: translateY(0); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
-  .btn-primary { background: var(--accent); color: #0d0d0f; width: 100%; margin-bottom: 10px; }
+  .btn-primary { background: var(--accent); color: #0d0d0d; width: 100%; margin-bottom: 10px; }
   .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid rgba(255,255,255,0.1); width: 100%; margin-bottom: 10px; }
   .btn-orange { background: var(--accent2); color: white; width: 100%; margin-bottom: 10px; }
-  .btn-green { background: var(--green); color: #0d0d0f; width: 100%; margin-bottom: 10px; }
+  .btn-green { background: var(--surface2); color: var(--text); border: 1px solid rgba(255,255,255,0.2); width: 100%; margin-bottom: 10px; }
 
   .room-code-big {
     font-family: var(--font-display);
@@ -569,7 +582,7 @@
     background: var(--surface2);
     border-radius: var(--radius);
     margin: 20px 0;
-    border: 2px dashed rgba(240,224,64,0.3);
+    border: 2px dashed rgba(255,255,255,0.15);
   }
 
   #host-player-list {
@@ -609,9 +622,9 @@
   }
 
   .q-add-btn {
-    background: var(--accent);
-    color: #0d0d0f;
-    border: none;
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid rgba(255,255,255,0.2);
     border-radius: 12px;
     font-family: var(--font-display);
     font-weight: 700;
@@ -646,7 +659,7 @@
   .q-num {
     font-family: var(--font-display);
     font-weight: 700;
-    color: var(--accent);
+    color: var(--muted);
     min-width: 22px;
     font-size: 0.9rem;
   }
@@ -683,7 +696,7 @@
 
   .progress-fill {
     height: 100%;
-    background: var(--accent);
+    background: var(--text);
     border-radius: 999px;
     transition: width 0.4s ease;
   }
@@ -720,8 +733,9 @@
 
   .ans-text { font-size: 1rem; }
   .vote-pill {
-    background: var(--accent);
-    color: #0d0d0f;
+    background: var(--surface2);
+    border: 1px solid rgba(255,255,255,0.2);
+    color: var(--text);
     font-family: var(--font-display);
     font-weight: 700;
     font-size: 0.8rem;
@@ -755,7 +769,7 @@
     transform: translateX(4px);
   }
 
-  .vote-btn.voted { border-color: var(--green); background: rgba(61,255,160,0.1); color: var(--green); }
+  .vote-btn.voted { border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); color: var(--text); }
   .vote-btn.own-answer { opacity: 0.4; cursor: not-allowed; }
 
   .own-tag {
@@ -780,12 +794,13 @@
     border: 1px solid rgba(255,255,255,0.05);
   }
 
-  .result-row:first-child { border-color: var(--accent); background: rgba(240,224,64,0.06); }
-  .result-rank { font-family: var(--font-display); font-size: 1.4rem; font-weight: 800; color: var(--accent); min-width: 30px; }
+  .result-row:first-child { border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.04); }
+  .result-rank { font-family: var(--font-display); font-size: 1.4rem; font-weight: 800; color: var(--muted); min-width: 30px; }
   .result-content { flex: 1; }
   .result-answer { font-size: 1rem; margin-bottom: 3px; }
   .result-author { font-size: 0.8rem; color: var(--muted); }
-  .result-votes { font-family: var(--font-display); font-weight: 700; color: var(--accent); font-size: 1.1rem; }
+  .result-voters { font-size: 0.75rem; color: var(--accent2); margin-top: 4px; }
+  .result-votes { font-family: var(--font-display); font-weight: 700; color: var(--text); font-size: 1.1rem; }
 
   .score-row {
     display: flex;
@@ -798,17 +813,17 @@
     animation: fadeUp 0.4s ease calc(var(--i) * 0.07s) both;
   }
 
-  .score-row.me { border: 2px solid var(--accent); background: rgba(240,224,64,0.06); }
+  .score-row.me { border: 1px solid rgba(255,255,255,0.3); background: rgba(255,255,255,0.04); }
   .score-row:first-child { font-size: 1.1rem; }
   .score-rank { font-size: 1.3rem; min-width: 30px; }
   .score-name { flex: 1; font-weight: 500; }
-  .score-pts { font-family: var(--font-display); font-weight: 700; color: var(--accent); }
+  .score-pts { font-family: var(--font-display); font-weight: 700; color: var(--text); }
 
   .answer-count-display {
     font-family: var(--font-display);
     font-size: 2.5rem;
     font-weight: 800;
-    color: var(--accent);
+    color: var(--text);
     text-align: center;
     margin: 16px 0;
   }
@@ -817,7 +832,7 @@
     font-family: var(--font-display);
     font-size: 3rem;
     font-weight: 800;
-    color: var(--green);
+    color: var(--text);
     text-align: center;
     padding: 30px 0 8px;
   }
@@ -861,11 +876,10 @@
 <!-- 1. Aloitus -->
 <div class="screen active" id="screen-home">
   <div class="logo">Mieli<span>pide</span>peli</div>
-  <p class="sub">Kuka tietää mitä muut ajattelevat?</p>
   <div class="card">
     <h2>Oletko pelinjärjestäjä vai pelaaja?</h2>
-    <button class="btn btn-primary" onclick="goHost()">🎮 Luo uusi huone</button>
-    <button class="btn btn-secondary" onclick="goJoin()">👋 Liity peliin</button>
+    <button class="btn btn-primary" onclick="goHost()">Luo uusi huone</button>
+    <button class="btn btn-secondary" onclick="goJoin()">Liity peliin</button>
   </div>
 </div>
 
@@ -930,7 +944,7 @@
   <div class="logo">Mieli<span>pide</span>peli</div>
   <div class="card">
     <div class="progress-wrap" id="host-results-progress"></div>
-    <h2>🏆 Kierroksen tulokset</h2>
+    <h2>Kierroksen tulokset</h2>
     <div id="host-results-list"></div>
   </div>
   <button class="btn btn-primary" id="btn-next-or-end" onclick="showScoreboard()">Pisteet →</button>
@@ -940,7 +954,7 @@
 <div class="screen" id="screen-host-scoreboard">
   <div class="logo">Mieli<span>pide</span>peli</div>
   <div class="card">
-    <h2>📊 Tilanne</h2>
+    <h2>Tilanne</h2>
     <div id="scoreboard-list"></div>
   </div>
   <button class="btn btn-orange" id="btn-scoreboard-next" onclick="nextQuestion()">Seuraava kysymys →</button>
@@ -950,8 +964,7 @@
 <div class="screen" id="screen-host-gameover">
   <div class="logo">Mieli<span>pide</span>peli</div>
   <div class="card">
-    <div class="gameover-trophy">🏆</div>
-    <h2 style="text-align:center;">Peli ohi!</h2>
+        <h2 style="text-align:center;">Peli ohi!</h2>
     <div id="final-scoreboard-list"></div>
   </div>
   <button class="btn btn-primary" onclick="location.reload()">Uusi peli</button>
@@ -1006,7 +1019,7 @@
 <div class="screen" id="screen-player-scoreboard">
   <div class="logo">Mieli<span>pide</span>peli</div>
   <div class="card">
-    <h2>📊 Tilanne</h2>
+    <h2>Tilanne</h2>
     <div id="player-scoreboard-list"></div>
   </div>
 </div>
@@ -1015,8 +1028,7 @@
 <div class="screen" id="screen-player-gameover">
   <div class="logo">Mieli<span>pide</span>peli</div>
   <div class="card">
-    <div class="gameover-trophy">🎉</div>
-    <h2 style="text-align:center;">Peli ohi!</h2>
+        <h2 style="text-align:center;">Peli ohi!</h2>
     <div id="player-final-scoreboard-list"></div>
   </div>
   <button class="btn btn-secondary" onclick="location.reload()">Takaisin alkuun</button>
