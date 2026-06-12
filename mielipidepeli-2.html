@@ -61,9 +61,39 @@
       answers: {},
       votes: {}
     });
+    localStorage.setItem('mielipidepeli_host_session', JSON.stringify({
+      roomCode: roomCode,
+      questionBank: []
+    }));
     document.getElementById('display-code').textContent = roomCode;
     show('screen-host-lobby');
     listenRoom();
+  };
+
+  // ── Host: automaattinen uudelleenliittyminen ──
+  window.tryReconnectHost = async () => {
+    const saved = localStorage.getItem('mielipidepeli_host_session');
+    if (!saved) return false;
+
+    try {
+      const session = JSON.parse(saved);
+      roomCode = session.roomCode;
+      const snap = await get(roomRef());
+      if (!snap.exists()) {
+        localStorage.removeItem('mielipidepeli_host_session');
+        return false;
+      }
+      myRole = 'host';
+      questionBank = session.questionBank || [];
+      currentQuestionIndex = Math.max(0, (snap.val().questionIndex || 0));
+      document.getElementById('display-code').textContent = roomCode;
+      renderQuestionBank();
+      listenRoom();
+      return true;
+    } catch (e) {
+      localStorage.removeItem('mielipidepeli_host_session');
+      return false;
+    }
   };
 
   window.goJoin = () => {
@@ -84,9 +114,57 @@
     myPlayerId = push(roomRef('/players')).key;
     await set(roomRef(`/players/${myPlayerId}`), { name, score: 0 });
 
+    // Tallenna selaimen muistiin uudelleenliittymistä varten
+    localStorage.setItem('mielipidepeli_session', JSON.stringify({
+      roomCode: roomCode,
+      playerId: myPlayerId,
+      name: myName
+    }));
+
     show('screen-player-lobby');
     document.getElementById('player-waiting-name').textContent = name;
     listenRoom();
+  };
+
+  // ── Automaattinen uudelleenliittyminen ──
+  window.tryReconnect = async () => {
+    const saved = localStorage.getItem('mielipidepeli_session');
+    if (!saved) return false;
+
+    try {
+      const session = JSON.parse(saved);
+      roomCode = session.roomCode;
+      const snap = await get(roomRef());
+      if (!snap.exists()) {
+        localStorage.removeItem('mielipidepeli_session');
+        return false;
+      }
+      const data = snap.val();
+      if (!data.players || !data.players[session.playerId]) {
+        localStorage.removeItem('mielipidepeli_session');
+        return false;
+      }
+
+      // Pelaaja löytyi - palautetaan peliin
+      myRole = 'player';
+      myPlayerId = session.playerId;
+      myName = session.name;
+      document.getElementById('player-waiting-name').textContent = myName;
+
+      // Jos pelaaja oli vastannut/äänestänyt edellisellä kierroksella, palauta tila
+      if (data.answers && data.answers[myPlayerId]) {
+        myAnswerKey = myPlayerId;
+      }
+      if (data.votes && data.votes[myPlayerId]) {
+        hasVoted = true;
+      }
+
+      listenRoom();
+      return true;
+    } catch (e) {
+      localStorage.removeItem('mielipidepeli_session');
+      return false;
+    }
   };
 
   // ── Kysymyspankki ──
@@ -97,11 +175,21 @@
     questionBank.push(q);
     input.value = '';
     renderQuestionBank();
+    saveHostSession();
   };
+
+  function saveHostSession() {
+    if (myRole !== 'host') return;
+    localStorage.setItem('mielipidepeli_host_session', JSON.stringify({
+      roomCode: roomCode,
+      questionBank: questionBank
+    }));
+  }
 
   window.removeQuestion = (i) => {
     questionBank.splice(i, 1);
     renderQuestionBank();
+    saveHostSession();
   };
 
   function renderQuestionBank() {
@@ -246,6 +334,7 @@
     } else if (phase === 'gameover') {
       show('screen-host-gameover');
       renderScoreboard(data.players, 'final-scoreboard-list');
+      localStorage.removeItem('mielipidepeli_host_session');
     }
   }
 
@@ -253,18 +342,28 @@
     if (phase === 'lobby') {
       show('screen-player-lobby');
     } else if (phase === 'answering') {
-      hasVoted = false;
-      myAnswerKey = null;
       show('screen-player-answering');
       document.getElementById('player-q-display').textContent = data.question;
-      document.getElementById('player-answer').value = '';
-      document.getElementById('player-answer').disabled = false;
-      document.getElementById('btn-submit-answer').disabled = false;
-      document.getElementById('answer-sent-msg').style.display = 'none';
       renderProgress(data.questionIndex, data.totalQuestions, 'player-progress');
+
+      const alreadyAnswered = data.answers && data.answers[myPlayerId];
+      if (alreadyAnswered) {
+        myAnswerKey = myPlayerId;
+        document.getElementById('player-answer').value = data.answers[myPlayerId].text;
+        document.getElementById('player-answer').disabled = true;
+        document.getElementById('btn-submit-answer').disabled = true;
+        document.getElementById('answer-sent-msg').style.display = 'block';
+      } else {
+        hasVoted = false;
+        myAnswerKey = null;
+        document.getElementById('player-answer').value = '';
+        document.getElementById('player-answer').disabled = false;
+        document.getElementById('btn-submit-answer').disabled = false;
+        document.getElementById('answer-sent-msg').style.display = 'none';
+      }
     } else if (phase === 'voting') {
       show('screen-player-voting');
-      renderVotingOptions(data.answers, data.answerOrder, data.question);
+      renderVotingOptions(data.answers, data.answerOrder, data.question, data.votes);
       renderProgress(data.questionIndex, data.totalQuestions, 'player-vote-progress');
     } else if (phase === 'results') {
       show('screen-player-results');
@@ -275,6 +374,7 @@
     } else if (phase === 'gameover') {
       show('screen-player-gameover');
       renderPlayerScoreboard(data.players, 'player-final-scoreboard-list');
+      localStorage.removeItem('mielipidepeli_session');
     }
   }
 
@@ -333,24 +433,26 @@
     });
   }
 
-  function renderVotingOptions(answers, order, question) {
+  function renderVotingOptions(answers, order, question, votes) {
     document.getElementById('vote-q-display').textContent = question || '';
     const el = document.getElementById('voting-options');
     if (!answers) { el.innerHTML = ''; return; }
     const keys = order || Object.keys(answers);
-    hasVoted = false;
+    const myVote = votes ? votes[myPlayerId] : null;
+    hasVoted = !!myVote;
     el.innerHTML = keys.map((k, i) => {
       const a = answers[k];
       const isOwn = (k === myPlayerId);
-      return `<button class="vote-btn ${isOwn ? 'own-answer' : ''}"
+      const isVoted = (k === myVote);
+      return `<button class="vote-btn ${isOwn ? 'own-answer' : ''} ${isVoted ? 'voted' : ''}"
         data-key="${k}"
         onclick="castVote('${k}')"
-        ${isOwn ? 'disabled title="Oma vastauksesi"' : ''}>
+        ${(isOwn || hasVoted) ? 'disabled' : ''} ${isOwn ? 'title="Oma vastauksesi"' : ''}>
         ${a.text}
         ${isOwn ? '<span class="own-tag">oma</span>' : ''}
       </button>`;
     }).join('');
-    document.getElementById('voted-msg').style.display = 'none';
+    document.getElementById('voted-msg').style.display = hasVoted ? 'block' : 'none';
   }
 
   function renderResults(answers, votes, players, scoresUpdated) {
@@ -442,6 +544,12 @@
 
   // init question bank render
   renderQuestionBank();
+
+  // Yritä automaattista uudelleenliittymistä, jos selaimessa on tallennettu sessio
+  (async () => {
+    const hostOk = await tryReconnectHost();
+    if (!hostOk) await tryReconnect();
+  })();
 </script>
 
 <style>
